@@ -1,0 +1,11 @@
+# MY THEME!!
+name=Ocean
+bg=0x0841
+primary=0x07FF
+secondary=0x5D7F
+accent=0xFFE0
+barLow=0x07E0
+barMid=0xFFE0
+barHigh=0xF800
+headerBg=0x001F
+headerText=0xFFFF

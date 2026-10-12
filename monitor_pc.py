@@ -8,6 +8,7 @@ import traceback
 import logging
 import atexit
 import threading
+import math
 
 import serial
 import serial.tools.list_ports
@@ -32,14 +33,14 @@ _fmt = logging.Formatter(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-_file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-_file_handler.setFormatter(_fmt)
-logger.addHandler(_file_handler)
+_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_fh.setFormatter(_fmt)
+logger.addHandler(_fh)
 
-_console_handler = logging.StreamHandler(sys.stdout)
-_console_handler.setFormatter(_fmt)
-_console_handler.setLevel(logging.INFO)
-logger.addHandler(_console_handler)
+_ch = logging.StreamHandler(sys.stdout)
+_ch.setFormatter(_fmt)
+_ch.setLevel(logging.INFO)
+logger.addHandler(_ch)
 
 
 def log(msg, level="info"):
@@ -60,36 +61,31 @@ def _excepthook(exc_type, exc_value, exc_tb):
 
 
 sys.excepthook = _excepthook
-
-
-def _on_exit():
-    logger.info("Скрипт завершён")
-
-
-atexit.register(_on_exit)
-
+atexit.register(lambda: logger.info("Скрипт завершён"))
 log(f"Запуск monitor_pc.py. Лог-файл: {LOG_FILE}")
 
 
 # ==================== Настройки ====================
-BAUD_RATE = 115200
+BAUD_RATE = 460800
 SEND_INTERVAL = 1.0
 OHM_URL = "http://127.0.0.1:8085/data.json"
-
-# ESP32-C3 от Espressif имеет VID 303A. Можно сузить по PID.
 ESP_VID = "303A"
 
-RECONNECT_AFTER_FAILURES = 3
-RECONNECT_ATTEMPTS = 5
-RECONNECT_DELAY = 2.0
+CHUNK_SIZE = 64
+CHUNK_TIMEOUT = 10.0
+PORT_TIMEOUT = 0.05
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+GIFS_DIR = os.path.join(SCRIPT_DIR, "GIFs")
+THEMES_DIR = os.path.join(SCRIPT_DIR, "Themes")
+os.makedirs(GIFS_DIR, exist_ok=True)
+os.makedirs(THEMES_DIR, exist_ok=True)
+
+THEME_EXT = ".thme"
 
 
-# ==================== Утилита: поиск COM-порта ESP32 ====================
+# ==================== Поиск COM-порта ====================
 def find_esp_port():
-    """
-    Ищет COM-порт, принадлежащий ESP32 (по VID 303A).
-    Возвращает имя порта ('COM6') или None.
-    """
     try:
         for p in serial.tools.list_ports.comports():
             hwid = (p.hwid or "").upper()
@@ -154,164 +150,516 @@ def find(sensors, keywords, unit=None, exclude=None):
     return None
 
 
-def get_all_values(sensors):
-    v = {k: None for k in
-         ["CPU", "RAM", "TEMP", "GPU", "GPUTEMP", "VRAM", "FAN", "CLK", "PWR"]}
+def discover_all_categories(sensors):
     if sensors is None:
-        return v
+        return {}
+    categories = {}
 
-    v["CPU"] = find(sensors, ["CPU/Total", "CPU Package", "CPU Total"], unit="%")
-    if v["CPU"] is None:
-        v["CPU"] = find(sensors, ["CPU"], unit="%", exclude=["core", "thread"])
-
-    v["RAM"] = find(sensors, ["Memory/Memory Used", "Memory/Used Memory",
-                              "RAM/Memory Used"], unit="%")
-    if v["RAM"] is None:
-        v["RAM"] = find(sensors, ["Memory"], unit="%")
-
+    cpu_load = find(sensors, ["CPU/Total", "CPU Package", "CPU Total"], unit="%")
+    if cpu_load is None:
+        cpu_load = find(sensors, ["CPU"], unit="%", exclude=["core", "thread"])
+    cpu_temp = None
     for name in ["CPU Package", "CPU (Tctl/Tdie)", "CPU (Tctl)", "CPU (Tdie)",
-                 "Core Average", "CPU Core", "CPU"]:
-        v["TEMP"] = find(sensors, [name], unit="°C")
-        if v["TEMP"] is not None:
+                 "Core Average", "CPU Core"]:
+        cpu_temp = find(sensors, [name], unit="°C")
+        if cpu_temp is not None:
             break
-
-    v["GPU"] = find(sensors, ["GPU Core/GPU Core Load", "GPU Core/Load",
-                              "GPU/Load", "D3D 3D"], unit="%")
-    if v["GPU"] is None:
-        v["GPU"] = find(sensors, ["GPU"], unit="%")
-
-    for name in ["GPU Core", "GPU Hot Spot", "GPU"]:
-        v["GPUTEMP"] = find(sensors, [name], unit="°C")
-        if v["GPUTEMP"] is not None:
-            break
-
-    v["VRAM"] = find(sensors, ["GPU Memory/GPU Memory Used",
-                               "GPU Memory/Used", "D3D Dedicated Memory Used"],
-                     unit="%")
-    if v["VRAM"] is None:
-        v["VRAM"] = find(sensors, ["GPU Memory"], unit="%")
-
-    v["FAN"] = find(sensors, ["Fan", "FAN"], unit="RPM")
-
-    v["CLK"] = find(sensors, ["CPU Core #1/Clock", "CPU Cores/Clock",
+    cpu_clk = find(sensors, ["CPU Core #1/Clock", "CPU Cores/Clock",
                               "CPU/Clock", "Core #1"], unit="MHz")
-    if v["CLK"] is None:
-        v["CLK"] = find(sensors, ["Clock"], unit="MHz")
-
-    v["PWR"] = find(sensors, ["CPU Package/Power", "CPU/Package",
+    if cpu_clk is None:
+        cpu_clk = find(sensors, ["Clock"], unit="MHz")
+    cpu_pwr = find(sensors, ["CPU Package/Power", "CPU/Package",
                               "CPU Cores/Power", "Package"], unit="W")
-    if v["PWR"] is None:
-        v["PWR"] = find(sensors, ["Package"], unit="W")
+    if cpu_pwr is None:
+        cpu_pwr = find(sensors, ["Package"], unit="W")
 
-    return v
+    if any(v is not None for v in [cpu_load, cpu_temp, cpu_clk, cpu_pwr]):
+        categories["CPU"] = {
+            "CPU": cpu_load, "TEMP": cpu_temp,
+            "CLK": cpu_clk, "PWR": cpu_pwr,
+        }
+
+    ram_load = find(sensors, ["Memory/Memory Used", "Memory/Used Memory",
+                               "RAM/Memory Used"], unit="%")
+    if ram_load is None:
+        ram_load = find(sensors, ["Memory"], unit="%")
+    if ram_load is not None:
+        categories["RAM"] = {"RAM": ram_load}
+
+    gpu_load = find(sensors, ["GPU Core/GPU Core Load", "GPU Core/Load",
+                              "GPU/Load", "D3D 3D"], unit="%")
+    if gpu_load is None:
+        gpu_load = find(sensors, ["GPU"], unit="%")
+    gpu_temp = None
+    for name in ["GPU Core", "GPU Hot Spot", "GPU"]:
+        gpu_temp = find(sensors, [name], unit="°C")
+        if gpu_temp is not None:
+            break
+    vram_load = find(sensors, ["GPU Memory/GPU Memory Used",
+                                "GPU Memory/Used", "D3D Dedicated Memory Used"],
+                      unit="%")
+    if vram_load is None:
+        vram_load = find(sensors, ["GPU Memory"], unit="%")
+
+    if any(v is not None for v in [gpu_load, gpu_temp, vram_load]):
+        categories["GPU"] = {
+            "GPU": gpu_load, "GPUTEMP": gpu_temp, "VRAM": vram_load,
+        }
+
+    fan_rpm = find(sensors, ["Fan", "FAN"], unit="RPM")
+    if fan_rpm is not None:
+        categories["FAN"] = {"FAN": fan_rpm}
+
+    mobo_temp = find(sensors, ["Motherboard", "Chipset", "System"], unit="°C")
+    if mobo_temp is not None:
+        categories["MOBO"] = {"MTEMP": mobo_temp}
+
+    storage_temp = find(sensors, ["Temperature", "Drive"], unit="°C",
+                        exclude=["CPU", "GPU", "Core"])
+    storage_used = find(sensors, ["Used Space"], unit="%")
+    if storage_temp is not None or storage_used is not None:
+        categories["STORAGE"] = {
+            "STEMP": storage_temp, "SUSED": storage_used,
+        }
+
+    return categories
 
 
 def fmt(val):
     return f"{val:.1f}" if val is not None else "-1"
 
 
-# ==================== Отправка данных на ESP32 ====================
-def run_serial_loop(stop_event):
-    """
-    Основной цикл: открывает порт, шлёт данные, следит за stop_event.
-    При ошибке записи — переподключается.
-    """
-    port = find_esp_port()
-    if port is None:
-        log("ESP32 не найдена при старте цикла", "warning")
-        return
+def serialize_categories(categories):
+    parts = []
+    for cat_name, cat_data in categories.items():
+        items = []
+        for key, val in cat_data.items():
+            items.append(f"{key}={fmt(val)}")
+        parts.append(f"{cat_name}:" + ",".join(items))
+    return ";".join(parts)
 
-    log(f"Начинаю работу с {port}")
-    ser = None
-    failures = 0
 
-    def open_port():
-        for attempt in range(1, RECONNECT_ATTEMPTS + 1):
-            if stop_event.is_set():
-                return None
-            try:
-                s = serial.Serial(port, BAUD_RATE, timeout=1, write_timeout=1)
-                time.sleep(2)
-                log(f"Порт {port} открыт (попытка {attempt})")
-                return s
-            except serial.SerialException as e:
-                log(f"Не удалось открыть {port}: {e}", "warning")
-                time.sleep(RECONNECT_DELAY)
-        log(f"Порт {port} недоступен после {RECONNECT_ATTEMPTS} попыток", "error")
+# ==================== Общее состояние ====================
+serial_lock = threading.Lock()
+pause_telemetry = threading.Event()
+stop_event = threading.Event()
+ser_holder = {"ser": None}
+
+transfer_in_progress = threading.Event()
+
+
+# ==================== Сканирование содержимого одной директории ====================
+def list_dir(rel_path):
+    rel_path = rel_path.strip().strip("/")
+    target = os.path.join(GIFS_DIR, rel_path.replace("/", os.sep)) if rel_path else GIFS_DIR
+
+    if not os.path.isdir(target):
+        log(f"list_dir: не найдена директория {target}", "warning")
+        return []
+
+    entries = []
+    try:
+        for entry in sorted(os.listdir(target)):
+            full_path = os.path.join(target, entry)
+            if os.path.isdir(full_path):
+                entries.append(f"DIR:{entry}")     # ← basename
+            elif entry.lower().endswith(".gif") and os.path.isfile(full_path):
+                entries.append(entry)              # ← basename
+    except Exception as e:
+        log(f"Ошибка сканирования {target}: {e}", "error")
+    return entries
+
+
+# ==================== Сканирование тем (.thme) ====================
+def scan_themes_recursive(base_dir, prefix=""):
+    entries = []
+    try:
+        for entry in sorted(os.listdir(base_dir)):
+            full_path = os.path.join(base_dir, entry)
+            rel_path = os.path.join(prefix, entry).replace("\\", "/")
+            if os.path.isdir(full_path):
+                entries.extend(scan_themes_recursive(full_path, rel_path))
+            elif entry.lower().endswith(THEME_EXT) and os.path.isfile(full_path):
+                entries.append(rel_path)
+    except Exception as e:
+        log(f"Ошибка сканирования тем {base_dir}: {e}", "error")
+    return entries
+
+
+def list_themes():
+    return scan_themes_recursive(THEMES_DIR)
+
+
+def read_theme_file(rel_path):
+    path = os.path.join(THEMES_DIR, rel_path)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = []
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("#") or stripped.startswith(";"):
+                    continue
+                lines.append(stripped)
+        return "\n".join(lines)
+    except Exception as e:
+        log(f"Ошибка чтения темы {rel_path}: {e}", "error")
         return None
 
-    ser = open_port()
+
+# ==================== Низкоуровневый обмен ====================
+def send_raw(data: bytes):
+    ser = ser_holder["ser"]
     if ser is None:
         return
-
-    sensors = fetch_sensors()
-    if sensors is None:
-        log("LibreHardwareMonitor недоступен. Проверьте http://localhost:8085", "warning")
-    else:
-        log(f"Найдено сенсоров: {len(sensors)}")
-
-    while not stop_event.is_set():
+    with serial_lock:
         try:
-            # Перед записью проверяем, что устройство всё ещё подключено
-            if find_esp_port() != port:
-                log("ESP32 отключена, останавливаю цикл отправки")
-                break
-
-            sensors = fetch_sensors()
-            v = get_all_values(sensors)
-
-            line = (
-                f"CPU:{fmt(v['CPU'])},"
-                f"RAM:{fmt(v['RAM'])},"
-                f"TEMP:{fmt(v['TEMP'])},"
-                f"GPU:{fmt(v['GPU'])},"
-                f"GPUTEMP:{fmt(v['GPUTEMP'])},"
-                f"VRAM:{fmt(v['VRAM'])},"
-                f"FAN:{fmt(v['FAN'])},"
-                f"CLK:{fmt(v['CLK'])},"
-                f"PWR:{fmt(v['PWR'])}\n"
-            )
-
-            try:
-                ser.write(line.encode("utf-8"))
-                failures = 0
-            except (serial.SerialException, OSError) as e:
-                failures += 1
-                log(f"Ошибка записи ({failures}/{RECONNECT_AFTER_FAILURES}): {e}", "error")
-                if failures >= RECONNECT_AFTER_FAILURES:
-                    log("Переподключение к порту...", "warning")
-                    try:
-                        ser.close()
-                    except Exception:
-                        pass
-                    if stop_event.is_set():
-                        break
-                    ser = open_port()
-                    if ser is None:
-                        break
-                    failures = 0
-
-            time.sleep(SEND_INTERVAL)
-
+            ser.write(data)
         except Exception as e:
-            log(f"Ошибка в цикле отправки: {e}", "error")
-            time.sleep(2)
+            log(f"Ошибка записи в Serial: {e}", "error")
+            try:
+                ser_holder["ser"].close()
+            except Exception:
+                pass
+            ser_holder["ser"] = None
+
+
+def read_line_raw(timeout=1.0):
+    """
+    Блокирующее чтение строки до \n.
+    ser.read(1) с ser.timeout = PORT_TIMEOUT (0.05 с) — возвращается сразу при байте.
+    """
+    ser = ser_holder["ser"]
+    if ser is None:
+        return None
+
+    buf = bytearray()
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            b = ser.read(1)
+        except Exception as e:
+            log(f"read_line_raw ошибка: {e}", "error")
+            return None
+
+        if not b:
+            continue
+
+        buf.extend(b)
+        if b == b'\n':
+            line = bytes(buf).decode("utf-8", errors="replace").strip()
+            return line
+
+    return None
+
+
+def transfer_chunks(data_bytes: bytes, header_magic: str, chunk_magic: str) -> bool:
+    size = len(data_bytes)
+    if size == 0:
+        return False
+    chunks = math.ceil(size / CHUNK_SIZE)
+
+    send_raw(f"{header_magic}:{size}:{chunks}\n".encode("utf-8"))
+
+    line = read_line_raw(timeout=15.0)
+    if line is None or not line.startswith("@READY"):
+        log(f"{header_magic}: не @READY, получили: {line}", "error")
+        return False
+
+    for n in range(chunks):
+        chunk = data_bytes[n * CHUNK_SIZE:(n + 1) * CHUNK_SIZE]
+        cs = len(chunk)
+
+        send_raw(f"{chunk_magic}:{n}:{cs}\n".encode("utf-8"))
+
+        line = read_line_raw(timeout=CHUNK_TIMEOUT)
+        if line is None:
+            log(f"{header_magic}: таймаут @GO:{n}", "error")
+            return False
+        if not line.startswith(f"@GO:{n}"):
+            log(f"{header_magic}: ожидали @GO:{n}, получили {line}", "error")
+            return False
+
+        send_raw(chunk)
+
+        line = read_line_raw(timeout=CHUNK_TIMEOUT)
+        if line is None:
+            log(f"{header_magic}: таймаут @OK:{n}", "error")
+            return False
+        if not line.startswith(f"@OK:{n}"):
+            log(f"{header_magic}: ожидали @OK:{n}, получили {line}", "error")
+            return False
+
+    send_raw(b"@END\n")
+
+    line = read_line_raw(timeout=15.0)
+    if line is None:
+        log(f"{header_magic}: нет @DONE", "warning")
+        return False
+    if line.startswith("@DONE"):
+        log(f"{header_magic}: OK (@DONE)")
+        return True
+    log(f"{header_magic}: ожидали @DONE, получили {line}", "warning")
+    return False
+
+
+# ==================== Обработка команд ====================
+def handle_ls(path=""):
+    path = path.strip().strip("/")
+    entries = list_dir(path)
+    payload = ",".join(entries)
+    log(f"@LS:{path} -> {len(entries)} записей")
+    send_raw(f"@LIST:{payload}\n".encode("utf-8"))
+
+
+def handle_themes_list():
+    entries = list_themes()
+    payload = ",".join(entries)
+    log(f"@LS_THEMES -> {len(entries)} тем")
+    send_raw(f"@LIST_THEMES:{payload}\n".encode("utf-8"))
+
+
+def handle_theme_get(rel_path: str):
+    rel_path = rel_path.strip().replace("\\", "/")
+    content = read_theme_file(rel_path)
+    if content is None:
+        log(f"@THEMEGET {rel_path}: не найден", "warning")
+        send_raw(b"@ERR:theme_not_found\n")
+        return
+
+    data_bytes = content.encode("utf-8")
+    log(f"@THEMEGET {rel_path}: {len(data_bytes)} байт")
 
     try:
-        if ser:
-            ser.close()
-    except Exception:
-        pass
-    log("Цикл отправки завершён")
+        try:
+            if ser_holder["ser"] is not None:
+                ser_holder["ser"].reset_input_buffer()
+        except Exception:
+            pass
+
+        ok = transfer_chunks(data_bytes, "@THEMEFILE", "@THEMECHUNK")
+        if not ok:
+            send_raw(b"@ERR:theme_transfer\n")
+    except Exception as e:
+        log(f"@THEMEGET {rel_path}: ошибка: {e}", "error")
+        send_raw(b"@ERR:theme_read\n")
+
+
+def handle_get(filename: str):
+    filename = filename.strip().replace("\\", "/")
+    path = os.path.join(GIFS_DIR, filename.replace("/", os.sep))
+
+    if not os.path.isfile(path):
+        log(f"@GET {filename}: не найден", "warning")
+        send_raw(b"@ERR:not_found\n")
+        return
+
+    size = os.path.getsize(path)
+    if size == 0:
+        log(f"@GET {filename}: пустой", "warning")
+        send_raw(b"@ERR:empty\n")
+        return
+
+    chunks = math.ceil(size / CHUNK_SIZE)
+    log(f"@GET {filename}: {size} байт, {chunks} чанков по {CHUNK_SIZE}")
+
+    try:
+        try:
+            if ser_holder["ser"] is not None:
+                ser_holder["ser"].reset_input_buffer()
+        except Exception:
+            pass
+
+        send_raw(f"@FILE:{filename}:{size}:{chunks}\n".encode("utf-8"))
+
+        line = read_line_raw(timeout=15.0)
+        if line is None or not line.startswith("@READY"):
+            log(f"@GET {filename}: не @READY, получили: {line}", "error")
+            return
+
+        with open(path, "rb") as f:
+            for n in range(chunks):
+                chunk = f.read(CHUNK_SIZE)
+                cs = len(chunk)
+
+                send_raw(f"@CHUNK:{n}:{cs}\n".encode("utf-8"))
+
+                line = read_line_raw(timeout=CHUNK_TIMEOUT)
+                if line is None:
+                    log(f"@GET {filename}: таймаут @GO:{n}", "error")
+                    return
+                if not line.startswith(f"@GO:{n}"):
+                    log(f"@GET {filename}: ожидали @GO:{n}, получили {line}", "error")
+                    return
+
+                send_raw(chunk)
+
+                line = read_line_raw(timeout=CHUNK_TIMEOUT)
+                if line is None:
+                    log(f"@GET {filename}: таймаут @OK:{n}", "error")
+                    return
+                if not line.startswith(f"@OK:{n}"):
+                    log(f"@GET {filename}: ожидали @OK:{n}, получили {line}", "error")
+                    return
+
+        send_raw(b"@END\n")
+
+        line = read_line_raw(timeout=15.0)
+        if line is None:
+            log(f"@GET {filename}: нет @DONE", "warning")
+        elif line.startswith("@DONE"):
+            log(f"@GET {filename}: OK (@DONE)")
+        else:
+            log(f"@GET {filename}: ожидали @DONE, получили {line}", "warning")
+
+    except Exception as e:
+        log(f"@GET {filename}: ошибка: {e}", "error")
+        send_raw(b"@ERR:read\n")
+
+
+# ==================== Отправка времени ====================
+def send_time_once():
+    ser = ser_holder["ser"]
+    if ser is None:
+        return
+    t = datetime.datetime.now()
+    line = f"@TIME:{t.hour:02d}:{t.minute:02d}:{t.second:02d}\n"
+    with serial_lock:
+        try:
+            ser.write(line.encode("utf-8"))
+            log(f"@TIME отправлено: {t.hour:02d}:{t.minute:02d}:{t.second:02d}")
+        except Exception as e:
+            log(f"Ошибка отправки @TIME: {e}", "error")
+
+
+# ==================== Чтение строк от ESP32 ====================
+def serial_reader():
+    while not stop_event.is_set():
+        if transfer_in_progress.is_set():
+            time.sleep(0.02)
+            continue
+
+        ser = ser_holder["ser"]
+        if ser is None:
+            time.sleep(0.5)
+            continue
+
+        try:
+            raw = ser.readline()
+        except Exception as e:
+            log(f"Ошибка чтения Serial: {e}", "error")
+            try:
+                ser.close()
+            except Exception:
+                pass
+            ser_holder["ser"] = None
+            time.sleep(0.5)
+            continue
+
+        if not raw:
+            continue
+
+        try:
+            line = raw.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
+
+        if not line:
+            continue
+
+        log(f"ESP32: {line}", "debug")
+
+        if line.startswith("Ready"):
+            log("ESP32 готова, синхронизирую время")
+            send_time_once()
+        elif line.startswith("@LS_THEMES"):
+            handle_themes_list()
+        elif line.startswith("@THEMEGET:"):
+            tname = line[10:]
+            transfer_in_progress.set()
+            pause_telemetry.set()
+            try:
+                handle_theme_get(tname)
+            finally:
+                transfer_in_progress.clear()
+                pause_telemetry.clear()
+        elif line.startswith("@LS:"):
+            path = line[4:]
+            handle_ls(path)
+        elif line == "@LS":
+            handle_ls("")
+        elif line.startswith("@LS"):
+            # на случай старого формата
+            handle_ls("")
+        elif line.startswith("@GET:"):
+            fname = line[5:]
+            transfer_in_progress.set()
+            pause_telemetry.set()
+            try:
+                handle_get(fname)
+            finally:
+                transfer_in_progress.clear()
+                pause_telemetry.clear()
+        elif line.startswith("@PAUSE"):
+            log("Телеметрия приостановлена")
+            pause_telemetry.set()
+        elif line.startswith("@RESUME"):
+            log("Телеметрия возобновлена")
+            pause_telemetry.clear()
+        elif line.startswith("@LISTOK:"):
+            log(f"ESP32 приняла список GIF ({line})")
+        elif line.startswith("@THEMELISTOK:"):
+            log(f"ESP32 приняла список тем ({line})")
+
+
+# ==================== Отправка телеметрии ====================
+def telemetry_loop():
+    while not stop_event.is_set():
+        if pause_telemetry.is_set():
+            time.sleep(0.2)
+            continue
+
+        if transfer_in_progress.is_set():
+            time.sleep(0.2)
+            continue
+
+        ser = ser_holder["ser"]
+        if ser is None:
+            time.sleep(0.5)
+            continue
+
+        try:
+            sensors = fetch_sensors()
+            categories = discover_all_categories(sensors)
+            payload = serialize_categories(categories)
+
+            line = f"@DATA:{payload}\n"
+
+            if not pause_telemetry.is_set() and not transfer_in_progress.is_set():
+                with serial_lock:
+                    try:
+                        ser.write(line.encode("utf-8"))
+                    except Exception as e:
+                        log(f"Ошибка телеметрии: {e}", "error")
+                        try:
+                            ser.close()
+                        except Exception:
+                            pass
+                        ser_holder["ser"] = None
+                        continue
+
+        except Exception as e:
+            log(f"Ошибка телеметрии: {e}", "error")
+
+        time.sleep(SEND_INTERVAL)
 
 
 # ==================== WMI-наблюдатель ====================
-def wmi_watcher(worker_thread_holder, stop_event):
-    """
-    Основной цикл: ждёт события подключения/отключения USB.
-    При появлении ESP32 — запускает run_serial_loop в отдельном потоке.
-    При отключении — просит поток завершиться.
-    """
+def wmi_watcher():
     pythoncom.CoInitialize()
     log("WMI-наблюдатель запущен")
 
@@ -327,70 +675,106 @@ def wmi_watcher(worker_thread_holder, stop_event):
                 time.sleep(1)
                 continue
 
-            # EventType: 2 = Device Arrival, 3 = Device Removal
-            if event.EventType == 2:
-                log(f"USB device arrival (EventType={event.EventType})")
-            elif event.EventType == 3:
-                log(f"USB device removal (EventType={event.EventType})")
-            else:
+            if event.EventType not in (2, 3):
                 continue
 
-            time.sleep(0.5)  # даём Windows досоздать COM-порт
+            time.sleep(0.5)
 
             port = find_esp_port()
             has_esp = port is not None
 
-            worker = worker_thread_holder.get("thread")
+            if has_esp and ser_holder["ser"] is None:
+                log(f"ESP32 обнаружена на {port}, открываю порт")
+                try:
+                    s = serial.Serial(port, BAUD_RATE,
+                                      timeout=PORT_TIMEOUT,
+                                      write_timeout=1)
+                    time.sleep(2)
+                    ser_holder["ser"] = s
+                except Exception as e:
+                    log(f"Не удалось открыть {port}: {e}", "warning")
 
-            if has_esp and (worker is None or not worker.is_alive()):
-                # ESP подключилась и поток не работает — запускаем
-                log(f"ESP32 обнаружена на {port}, запускаю поток отправки")
-                worker_stop = threading.Event()
-                worker = threading.Thread(
-                    target=run_serial_loop,
-                    args=(worker_stop,),
-                    daemon=True,
-                )
-                worker_thread_holder["thread"] = worker
-                worker_thread_holder["stop"] = worker_stop
-                worker.start()
-
-            elif not has_esp and worker is not None and worker.is_alive():
-                # ESP отключилась — просим поток завершиться
-                log("ESP32 отключена, останавливаю поток отправки")
-                worker_thread_holder["stop"].set()
+            elif not has_esp and ser_holder["ser"] is not None:
+                log("ESP32 отключена, закрываю порт")
+                try:
+                    ser_holder["ser"].close()
+                except Exception:
+                    pass
+                ser_holder["ser"] = None
 
     finally:
         pythoncom.CoUninitialize()
         log("WMI-наблюдатель завершён")
 
 
+# ==================== USB watchdog ====================
+def usb_watchdog():
+    while not stop_event.is_set():
+        time.sleep(2.0)
+        if transfer_in_progress.is_set():
+            continue
+        ser = ser_holder["ser"]
+        if ser is None:
+            port = find_esp_port()
+            if port is not None:
+                log(f"[watchdog] ESP32 найдена на {port}, открываю порт")
+                try:
+                    s = serial.Serial(port, BAUD_RATE,
+                                      timeout=PORT_TIMEOUT,
+                                      write_timeout=1)
+                    time.sleep(2)
+                    ser_holder["ser"] = s
+                except Exception as e:
+                    log(f"[watchdog] Не удалось открыть {port}: {e}", "warning")
+            continue
+
+        try:
+            _ = ser.in_waiting
+        except Exception as e:
+            log(f"[watchdog] Порт мёртв ({e}), сбрасываю")
+            try:
+                ser.close()
+            except Exception:
+                pass
+            ser_holder["ser"] = None
+
+
 # ==================== main ====================
 def main():
-    stop_event = threading.Event()
-    worker_thread_holder = {"thread": None, "stop": None}
-
-    # Проверим, не подключена ли ESP32 уже сейчас — тогда не надо ждать события
     port = find_esp_port()
     if port is not None:
-        log(f"ESP32 уже подключена на {port}, запускаю сразу")
-        worker_stop = threading.Event()
-        worker = threading.Thread(
-            target=run_serial_loop, args=(worker_stop,), daemon=True
-        )
-        worker_thread_holder["thread"] = worker
-        worker_thread_holder["stop"] = worker_stop
-        worker.start()
+        log(f"ESP32 уже подключена на {port}")
+        try:
+            s = serial.Serial(port, BAUD_RATE,
+                              timeout=PORT_TIMEOUT,
+                              write_timeout=1)
+            time.sleep(2)
+            ser_holder["ser"] = s
+        except Exception as e:
+            log(f"Не удалось открыть {port}: {e}", "warning")
+
+    threads = [
+        threading.Thread(target=wmi_watcher, daemon=True, name="wmi"),
+        threading.Thread(target=serial_reader, daemon=True, name="serial"),
+        threading.Thread(target=telemetry_loop, daemon=True, name="telemetry"),
+        threading.Thread(target=usb_watchdog, daemon=True, name="watchdog"),
+    ]
+    for t in threads:
+        t.start()
 
     try:
-        wmi_watcher(worker_thread_holder, stop_event)
+        while not stop_event.is_set():
+            time.sleep(1)
     except KeyboardInterrupt:
         log("Остановлено пользователем")
     finally:
         stop_event.set()
-        w = worker_thread_holder.get("stop")
-        if w is not None:
-            w.set()
+        s = ser_holder.get("ser")
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
